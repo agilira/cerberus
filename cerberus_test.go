@@ -111,8 +111,8 @@ func TestRegisterProbe_DuplicateID(t *testing.T) {
 
 func TestRegisterProbe_WhileRunning(t *testing.T) {
 	c := New(Config{PollInterval: 100 * time.Millisecond})
-	c.Start()
-	defer c.Stop()
+	_ = c.Start()
+	defer func() { _ = c.Stop() }()
 
 	probe := &mockProbe{id: "late-probe"}
 	err := c.RegisterProbe(probe)
@@ -173,7 +173,7 @@ func TestStart_Stop(t *testing.T) {
 func TestStart_AlreadyRunning(t *testing.T) {
 	c := New(Config{PollInterval: 50 * time.Millisecond})
 	_ = c.Start()
-	defer c.Stop()
+	defer func() { _ = c.Stop() }()
 
 	err := c.Start()
 	if err == nil {
@@ -510,8 +510,8 @@ type mockProbe struct {
 	driftFrom   int // Start drifting from this poll index (-1 = never)
 	alwaysDrift bool
 	shouldFail  bool
+	shouldPanic bool
 	delay       time.Duration
-	lastState   uint64
 }
 
 func (m *mockProbe) ID() string {
@@ -529,6 +529,10 @@ func (m *mockProbe) Probe(ctx context.Context) (State, error) {
 			return State{}, ctx.Err()
 		case <-time.After(m.delay):
 		}
+	}
+
+	if m.shouldPanic {
+		panic("malicious probe panic payload")
 	}
 
 	count := m.pollCount.Add(1) - 1

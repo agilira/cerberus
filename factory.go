@@ -15,6 +15,7 @@ package cerberus
 import (
 	"context"
 	"fmt"
+	"regexp"
 	"sync"
 	"time"
 )
@@ -42,14 +43,49 @@ type ProbeDefinition struct {
 	Metadata map[string]string `json:"metadata,omitempty"`
 }
 
-// Validate checks that the ProbeDefinition is valid
+var (
+	// validIDRegex strictly limits IDs to alphanumeric, dash, underscore, and dot
+	validIDRegex = regexp.MustCompile(`^[a-zA-Z0-9_\-\.]+$`)
+)
+
+// Maximum constraints for adversarial protection
+const (
+	MaxProbeIDLength     = 128
+	MaxProbeTargetLength = 1024
+	MaxMetadataKeys      = 50
+	MaxMetadataValueLen  = 1024
+)
+
+// Validate checks that the ProbeDefinition is valid and free of obvious adversarial payloads
 func (d ProbeDefinition) Validate() error {
 	if d.ID == "" {
 		return fmt.Errorf("probe definition ID cannot be empty")
 	}
+	if len(d.ID) > MaxProbeIDLength {
+		return fmt.Errorf("probe definition ID exceeds maximum length of %d", MaxProbeIDLength)
+	}
+	if !validIDRegex.MatchString(d.ID) {
+		return fmt.Errorf("probe definition ID contains invalid characters: must match ^[a-zA-Z0-9_\\-\\.]+$")
+	}
+
 	if d.Target == "" {
 		return fmt.Errorf("probe definition target cannot be empty")
 	}
+	if len(d.Target) > MaxProbeTargetLength {
+		return fmt.Errorf("probe definition target exceeds maximum length of %d", MaxProbeTargetLength)
+	}
+
+	if d.Metadata != nil {
+		if len(d.Metadata) > MaxMetadataKeys {
+			return fmt.Errorf("probe metadata exceeds maximum allowed keys (%d)", MaxMetadataKeys)
+		}
+		for k, v := range d.Metadata {
+			if len(v) > MaxMetadataValueLen {
+				return fmt.Errorf("probe metadata value for key %q exceeds maximum length (%d)", k, MaxMetadataValueLen)
+			}
+		}
+	}
+
 	return nil
 }
 

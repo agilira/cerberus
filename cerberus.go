@@ -372,7 +372,19 @@ func (c *Cerberus) pollProbe(probe Probe) {
 	ctx, cancel := context.WithTimeout(context.Background(), c.config.ProbeTimeout)
 	defer cancel()
 
-	state, err := probe.Probe(ctx)
+	// Implement CWE-440 mitigation: Global panic isolation
+	var state State
+	var err error
+	
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				err = errors.New("CERBERUS_PROBE_PANIC", "probe execution panicked").
+					WithContext("panic", r)
+			}
+		}()
+		state, err = probe.Probe(ctx)
+	}()
 
 	if err != nil {
 		// Probe error - emit error drift

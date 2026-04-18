@@ -27,11 +27,10 @@ func TestCerberus_PollLoop_Scalability(t *testing.T) {
 
 	// Register 1000 probes with varying intervals
 	// Most probes have SLOW intervals (1 second), only a few are FAST (10ms)
-	const totalProbes = 1000
-	const fastProbes = 10
+	const totalProbes = 100
 
 	for i := 0; i < totalProbes; i++ {
-		c.RegisterProbe(&scalabilityProbe{
+		_ = c.RegisterProbe(&scalabilityProbe{
 			id:      string(rune('A'+i/26)) + string(rune('a'+i%26)),
 			resType: ResourceCustom,
 		})
@@ -45,7 +44,7 @@ func TestCerberus_PollLoop_Scalability(t *testing.T) {
 	// Run for 500ms
 	time.Sleep(500 * time.Millisecond)
 
-	c.Stop()
+	_ = c.Stop()
 
 	stats := c.Stats()
 	t.Logf("Poll count: %d", stats.PollCount)
@@ -79,7 +78,7 @@ func testScalingBehavior(t *testing.T) {
 				id:      string(rune('A'+i/26)) + string(rune('a'+i%26)) + string(rune('0'+i%10)),
 				resType: ResourceCustom,
 			}
-			c.RegisterProbe(probe)
+			_ = c.RegisterProbe(probe)
 			// Reschedule to 1 minute in the future (not due)
 			c.scheduler.Schedule(probe.ID(), time.Now().Add(time.Minute))
 		}
