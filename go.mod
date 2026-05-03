@@ -1,6 +1,6 @@
 module github.com/agilira/cerberus
 
-go 1.25
+go 1.25.9
 
 require github.com/agilira/go-errors v1.1.1
 
