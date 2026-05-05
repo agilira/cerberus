@@ -1,113 +1,70 @@
 # Cerberus
 
-**Lightweight Drift Detection Watchdog for Themis Security OS**
+Lightweight drift detection watchdog for security-critical Go applications.
 
-[![Go Version](https://img.shields.io/badge/Go-1.25-blue.svg)](https://go.dev/)
-[![License](https://img.shields.io/badge/License-MPL--2.0-green.svg)](../LICENSE)
-[![Coverage](https://img.shields.io/badge/Coverage-85%25-brightgreen.svg)]()
+Cerberus polls registered probes at configurable intervals and emits a
+`DriftEvent` when the state hash of a resource changes. It detects — it
+never acts. What to do with a drift event is the caller's responsibility.
 
----
-
-## Overview
-
-Cerberus is a high-performance, CPU-efficient drift detection engine designed for security-critical environments. Named after the three-headed guardian of the underworld, Cerberus watches your infrastructure and **barks** (emits events) when state changes occur—but never acts. Action is delegated to Themis OS.
-
-### Design Philosophy
-
-| Principle | Description |
-|-----------|-------------|
-| **Separation of Concerns** | Cerberus detects. Themis decides. Reflex acts. |
-| **CPU-Light Polling** | Ticker-based scheduling, no spin loops. |
-| **Sensitivity Profiles** | Per-resource polling intervals (secrets at 100ms, logs at 5s). |
-| **Dynamic Probes** | Runtime probe generation from WorldModel—no recompilation. |
-| **Context-Aware Probes** | All probes accept `context.Context` for timeout/cancellation. |
-| **Self-Health Monitoring** | Congestion detection and health checks. |
-| **State Persistence Hooks** | `OnStateChange`, `LoadBaseline`, `ExportState` for external persistence. |
-| **Zero Dependencies** | Only `github.com/agilira/go-errors` for structured errors. |
+License: MPL-2.0
+Requires: Go 1.22+
 
 ---
 
-## Architecture
+## Design principles
+
+- **Detect, never act.** Side effects belong outside the watchdog.
+- **Zero surprise dependencies.** Only `github.com/agilira/go-errors`.
+- **CPU-light.** One base ticker goroutine; probes scheduled via a priority
+  queue (`O(log n)` reschedule per probe, `O(k)` work per tick).
+- **Panic-safe.** A panicking probe emits `ChangeError` and does not crash
+  the host process (CWE-440 mitigation).
+- **Hot registration.** `RegisterProbe` and `UnregisterProbe` are safe to
+  call while the watchdog is running.
+- **Context-aware.** Every probe call is bounded by a configurable
+  `ProbeTimeout`; a hung probe times out instead of starving others
+  (CWE-770 mitigation).
+
+---
+
+## Installation
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                        CERBERUS ENGINE                          │
-├─────────────────────────────────────────────────────────────────┤
-│                                                                 │
-│  ┌──────────────┐    ┌──────────────┐    ┌──────────────┐      │
-│  │   Probe      │    │   Probe      │    │   Probe      │      │
-│  │   (File)     │    │   (Port)     │    │   (Secret)   │      │
-│  │   1s poll    │    │   500ms poll │    │   100ms poll │      │
-│  └──────┬───────┘    └──────┬───────┘    └──────┬───────┘      │
-│         │                   │                   │               │
-│         └───────────────────┼───────────────────┘               │
-│                             ▼                                   │
-│                 ┌───────────────────────┐                       │
-│                 │   SensitivityProfile  │                       │
-│                 │   (per-resource)      │                       │
-│                 └───────────┬───────────┘                       │
-│                             ▼                                   │
-│                 ┌───────────────────────┐                       │
-│                 │      Poll Loop        │                       │
-│                 │   (10ms base tick)    │                       │
-│                 └───────────┬───────────┘                       │
-│                             ▼                                   │
-│                 ┌───────────────────────┐                       │
-│                 │    DriftEvent Chan    │◄── Non-blocking       │
-│                 │    (buffered)         │    (drops on full)    │
-│                 └───────────┬───────────┘                       │
-│                             │                                   │
-└─────────────────────────────┼───────────────────────────────────┘
-                              ▼
-                 ┌───────────────────────┐
-                 │     THEMIS OS         │
-                 │  Policy → RBAC →      │
-                 │  WorldModel → Reflex  │
-                 └───────────────────────┘
-```
-
----
-
-## Quick Start
-
-### Installation
-
-```bash
 go get github.com/agilira/cerberus
 ```
 
-### Basic Usage
+---
+
+## Quick start
 
 ```go
-package main
+watchdog := cerberus.New(cerberus.Config{
+    BufferSize:   64,
+    ProbeTimeout: time.Second,
+    OnStateChange: func(id string, prev, curr *cerberus.State) {
+        // Persist curr to external storage for restart recovery.
+        db.SaveState(id, curr)
+    },
+})
 
-import (
-    "fmt"
-    "time"
-    
-    "github.com/agilira/cerberus"
-)
+// Restore baseline from a previous run (optional).
+watchdog.LoadBaseline(db.LoadAllStates())
 
-func main() {
-    // Create watchdog with default configuration
-    watchdog := cerberus.New(cerberus.Config{
-        PollInterval: 500 * time.Millisecond,
-        BufferSize:   64,
-    })
-    
-    // Register a file probe
-    probe := NewFileProbe("/etc/passwd")
-    watchdog.RegisterProbe(probe)
-    
-    // Start watching
-    watchdog.Start()
-    defer watchdog.Stop()
-    
-    // Consume drift events
-    for drift := range watchdog.Drifts() {
-        fmt.Printf("Drift detected: %s changed (%s)\n", 
-            drift.ResourceID, drift.ChangeType)
+if err := watchdog.RegisterProbe(myFileProbe); err != nil {
+    log.Fatal(err)
+}
+if err := watchdog.Start(); err != nil {
+    log.Fatal(err)
+}
+defer func() {
+    if err := watchdog.Stop(); err != nil {
+        // ErrCodeStopTimeout means a probe did not finish within 5s.
+        log.Println("cerberus stop:", err)
     }
+}()
+
+for event := range watchdog.Drifts() {
+    fmt.Printf("drift: %s changed [%s]\n", event.ResourceID, event.ChangeType)
 }
 ```
 
@@ -115,434 +72,260 @@ func main() {
 
 ## Configuration
 
-### Config Options
+All fields are optional. `New` applies safe defaults for any zero value.
 
-| Option | Type | Default | Description |
-|--------|------|---------|-------------|
-| `PollInterval` | `time.Duration` | 500ms | Base polling interval (deprecated with SensitivityProfile) |
-| `BufferSize` | `int` | 64 | DriftEvent channel buffer size |
-| `SensitivityProfile` | `*SensitivityProfile` | auto | Per-resource polling intervals |
-| `ProbeTimeout` | `time.Duration` | 1s | Max time to wait for a single probe |
-| `OnStateChange` | `StateChangeHandler` | nil | Called on every state change (for persistence) |
-| `CongestionThreshold` | `int` | 10 | Dropped events threshold for congestion alert |
-| `OnCongestion` | `CongestionHandler` | nil | Called when congestion threshold exceeded |
-| `EmitCongestionEvent` | `bool` | false | Emit self-drift event on congestion |
+| Field | Type | Default | Notes |
+|---|---|---|---|
+| `BufferSize` | `int` | 64 | Capacity of the drift event channel. Size for peak burst rate. |
+| `ProbeTimeout` | `time.Duration` | 1s | Maximum time one probe may run. Exceeded -> context cancelled. |
+| `SensitivityProfile` | `*SensitivityProfile` | auto | Per-resource poll intervals. Nil -> `DefaultSensitivityForResource`. |
+| `OnStateChange` | `StateChangeHandler` | nil | Called on every state transition (including first poll). |
+| `CongestionThreshold` | `int64` | 10 | Dropped-event count that fires `OnCongestion`. Resets on drain. |
+| `OnCongestion` | `CongestionHandler` | nil | Called once per congestion episode, not once per drop. |
+| `EmitCongestionEvent` | `bool` | false | Emit a `ChangeError` DriftEvent on congestion (opt-in). |
 
-### Sensitivity Levels
-
-Cerberus supports four sensitivity levels with default intervals:
-
-| Level | Interval | Use Case |
-|-------|----------|----------|
-| `SensitivityCritical` | 100ms | Secrets, certificates, IAM policies |
-| `SensitivityHigh` | 500ms | Ports, processes, network rules |
-| `SensitivityMedium` | 1s | Files, containers, services |
-| `SensitivityLow` | 5s | Logs, metrics, non-critical data |
-
-### Custom Sensitivity Profile
-
-```go
-// Create custom profile
-profile := cerberus.NewSensitivityProfile()
-
-// Override defaults
-profile.SetSensitivity(cerberus.ResourceSecret, cerberus.SensitivityCritical)
-profile.SetSensitivity(cerberus.ResourceFile, cerberus.SensitivityHigh)
-
-// Or set exact intervals
-profile.SetInterval(cerberus.ResourcePort, 250*time.Millisecond)
-
-// Apply to watchdog
-watchdog := cerberus.New(cerberus.Config{
-    SensitivityProfile: profile,
-})
-```
+`PollInterval` is accepted for backward compatibility but has no effect. Use
+`SensitivityProfile` to control polling frequency.
 
 ---
 
-## Resource Types
-
-Cerberus supports monitoring of diverse infrastructure resources:
-
-| Resource Type | Description | Default Sensitivity |
-|---------------|-------------|---------------------|
-| `ResourceFile` | File system objects | Medium (1s) |
-| `ResourcePort` | Network ports | High (500ms) |
-| `ResourceProcess` | Running processes | High (500ms) |
-| `ResourceSecret` | Secrets/credentials | Critical (100ms) |
-| `ResourceCertificate` | TLS/SSL certificates | Critical (100ms) |
-| `ResourceContainer` | Docker/K8s containers | Medium (1s) |
-| `ResourceService` | System services | Medium (1s) |
-| `ResourceDNS` | DNS records | Medium (1s) |
-| `ResourceIAMPolicy` | IAM/RBAC policies | Critical (100ms) |
-| `ResourceNetworkRule` | Firewall rules | High (500ms) |
-| `ResourceLog` | Log files | Low (5s) |
-| `ResourceEndpoint` | API endpoints | Medium (1s) |
-| `ResourceModelWeight` | AI model weights | Critical (100ms) |
-| `ResourcePromptTemplate` | LLM prompt templates | High (500ms) |
-| `ResourceEnvVar` | Environment variables | High (500ms) |
-| `ResourceAgentConfig` | AI agent configs | Critical (100ms) |
-| `ResourceCerberus` | Self-health monitoring | Medium (1s) |
-| `ResourceCustom` | User-defined | Medium (1s) |
-
----
-
-## Implementing Probes
-
-### Probe Interface
+## The Probe interface
 
 ```go
 type Probe interface {
-    // ID returns the unique identifier for this probe
-    ID() string
-    
-    // ResourceType returns the type of resource being monitored
+    ID()           string
     ResourceType() ResourceType
-    
-    // Probe executes the check and returns current state.
-    // The context provides timeout and cancellation support.
     Probe(ctx context.Context) (State, error)
 }
 ```
 
-### Example: File Probe
+Probes must be:
+
+- **Idempotent** — safe to call repeatedly without side effects.
+- **Context-aware** — respect `ctx.Done()` for clean cancellation.
+- **Fast** — aim well under the configured `ProbeTimeout`.
+- **Thread-safe** — may be called from the watchdog goroutine concurrently
+  with other probes in future worker-pool extensions.
+
+Example: file probe
 
 ```go
-type FileProbe struct {
-    path string
-}
+type FileProbe struct{ path string }
 
-func NewFileProbe(path string) *FileProbe {
-    return &FileProbe{path: path}
-}
-
-func (p *FileProbe) ID() string {
-    return "file:" + p.path
-}
-
-func (p *FileProbe) ResourceType() cerberus.ResourceType {
-    return cerberus.ResourceFile
-}
+func (p *FileProbe) ID() string                        { return "file:" + p.path }
+func (p *FileProbe) ResourceType() cerberus.ResourceType { return cerberus.ResourceFile }
 
 func (p *FileProbe) Probe(ctx context.Context) (cerberus.State, error) {
-    // Respect context cancellation
     select {
     case <-ctx.Done():
         return cerberus.State{}, ctx.Err()
     default:
     }
-
     info, err := os.Stat(p.path)
     if err != nil {
         return cerberus.State{}, err
     }
-    
-    // Compute hash from file metadata
-    hash := computeHash(info.ModTime(), info.Size(), info.Mode())
-    
+    h := fnv.New64a()
+    fmt.Fprintf(h, "%d%d%s", info.ModTime().UnixNano(), info.Size(), info.Mode())
     return cerberus.State{
         ResourceID: p.path,
-        Hash:       hash,
+        Hash:       h.Sum64(),
         Timestamp:  time.Now(),
-        Metadata: map[string]string{
-            "size": strconv.FormatInt(info.Size(), 10),
-            "mode": info.Mode().String(),
-        },
     }, nil
 }
 ```
 
 ---
 
-## Dynamic Probe Generation
+## Resource types
 
-### ProbeFactory
+| Constant | String | Default sensitivity |
+|---|---|---|
+| `ResourceFile` | `file` | Medium - 1s |
+| `ResourcePort` | `port` | High - 500ms |
+| `ResourceProcess` | `process` | High - 500ms |
+| `ResourceLog` | `log` | Low - 5s |
+| `ResourceContainer` | `container` | Medium - 1s |
+| `ResourceCertificate` | `certificate` | Critical - 100ms |
+| `ResourceDNS` | `dns` | Medium - 1s |
+| `ResourceIAMPolicy` | `iam_policy` | Critical - 100ms |
+| `ResourceNetworkRule` | `network_rule` | High - 500ms |
+| `ResourceSecret` | `secret` | Critical - 100ms |
+| `ResourceService` | `service` | Medium - 1s |
+| `ResourceEndpoint` | `endpoint` | Medium - 1s |
+| `ResourceCustom` | `custom` | Medium - 1s |
+| `ResourceModelWeight` | `model_weight` | Critical - 100ms |
+| `ResourcePromptTemplate` | `prompt_template` | High - 500ms |
+| `ResourceEnvVar` | `env_var` | High - 500ms |
+| `ResourceAgentConfig` | `agent_config` | Critical - 100ms |
+| `ResourceCerberus` | `cerberus` | Medium - 1s |
 
-For enterprise deployments, probes can be generated dynamically from configuration or WorldModel entities:
-
-```go
-// Create factory
-factory := cerberus.NewProbeFactory()
-
-// Register generators for each resource type
-factory.RegisterGenerator(cerberus.ResourceFile, func(ctx context.Context, def cerberus.ProbeDefinition) (cerberus.Probe, error) {
-    return cerberus.NewGenericProbe(def, func(ctx context.Context, target string) (uint64, error) {
-        // Check file and return hash
-        return checkFileHash(target)
-    }), nil
-})
-
-// Create probes from definitions (e.g., from WorldModel)
-definitions := []cerberus.ProbeDefinition{
-    {ID: "file:/etc/passwd", ResourceType: cerberus.ResourceFile, Target: "/etc/passwd"},
-    {ID: "port:22", ResourceType: cerberus.ResourcePort, Target: "22"},
-}
-
-probes, errs := factory.CreateProbesFromDefinitions(ctx, definitions)
-```
-
-### Integration with WorldModel
+Custom intervals override the sensitivity-based default:
 
 ```go
-// Extract probe definitions from WorldModel entities
-entities := worldModel.QueryEntities(ctx, query)
+profile := cerberus.NewSensitivityProfile()
+profile.SetInterval(cerberus.ResourceFile, 250*time.Millisecond)
+profile.SetSensitivity(cerberus.ResourceSecret, cerberus.SensitivityCritical)
 
-var entityLikes []orchestrator.EntityLike
-for _, e := range entities {
-    entityLikes = append(entityLikes, wrapEntity(e))
-}
-
-definitions := orchestrator.ExtractProbeDefinitions(entityLikes)
-probes, _ := factory.CreateProbesFromDefinitions(ctx, definitions)
-
-for _, probe := range probes {
-    watchdog.RegisterProbe(probe)
-}
+watchdog := cerberus.New(cerberus.Config{SensitivityProfile: profile})
 ```
+
+The absolute minimum interval is `MinPollInterval = 10ms`; values below this
+are clamped automatically.
 
 ---
 
-## Drift Events
-
-### DriftEvent Structure
+## Drift events
 
 ```go
 type DriftEvent struct {
-    ProbeID      string       // Probe that detected the drift
-    ResourceID   string       // Resource identifier
-    ResourceType ResourceType // Type of resource
-    ChangeType   ChangeType   // What changed
-    PrevHash     uint64       // Previous state hash
-    CurrHash     uint64       // Current state hash
-    Timestamp    time.Time    // When detected
-    Error        error        // Error if ChangeError
+    ProbeID      string
+    ResourceID   string
+    ResourceType ResourceType
+    ChangeType   ChangeType   // ChangeCreate | ChangeDrift | ChangeError | ...
+    PrevHash     uint64
+    CurrHash     uint64
+    Timestamp    time.Time
+    Error        error        // non-nil when ChangeType == ChangeError
 }
 ```
 
-### Change Types
-
-| Type | Description |
-|------|-------------|
-| `ChangeNone` | No change detected |
-| `ChangeCreate` | Resource first discovered (initial state) |
-| `ChangeModify` | Resource modified |
-| `ChangeDelete` | Resource deleted |
-| `ChangeDrift` | State hash changed (generic drift) |
-| `ChangeError` | Probe execution failed |
+`ChangeCreate` is emitted on the first poll for a probe (no previous state).
+`ChangeDrift` is emitted when the hash differs from the previous poll.
+`ChangeError` is emitted when the probe returns an error or panics.
 
 ---
 
-## Statistics and Monitoring
+## Dynamic probe generation
+
+`ProbeFactory` builds probes at runtime from `ProbeDefinition` values without
+stopping the watchdog:
+
+```go
+factory := cerberus.NewProbeFactory()
+factory.RegisterGenerator(cerberus.ResourceFile, func(ctx context.Context, def cerberus.ProbeDefinition) (cerberus.Probe, error) {
+    return NewFileProbe(def.Target), nil
+})
+
+defs := []cerberus.ProbeDefinition{
+    {ID: "file:/etc/passwd", ResourceType: cerberus.ResourceFile, Target: "/etc/passwd"},
+}
+probes, errs := factory.CreateProbesFromDefinitions(ctx, defs)
+for i, p := range probes {
+    if errs[i] != nil {
+        continue
+    }
+    _ = watchdog.RegisterProbe(p)
+}
+```
+
+`ProbeDefinition.Validate()` enforces `^[a-zA-Z0-9_\-\.]+$` on IDs and
+rejects null bytes, path separators, and oversized values (CWE-116).
+
+---
+
+## Baseline integrity
+
+Persisted state can be signed with HMAC-SHA256 to detect tampering:
+
+```go
+key := []byte("32-byte-secret-key-for-production!")
+
+// Before shutdown - sign and persist.
+signed, err := cerberus.SignBaseline(watchdog.ExportState(), key)
+saveToFile(signed)
+
+// On startup - verify before loading.
+loaded := loadFromFile()
+ok, err := cerberus.VerifyBaseline(loaded, key)
+if err != nil || !ok {
+    log.Fatal("baseline tampered - refusing to load")
+}
+watchdog.LoadBaseline(loaded.States)
+```
+
+`VerifyBaseline` uses `hmac.Equal` for constant-time comparison (CWE-354).
+
+---
+
+## Statistics and health
 
 ```go
 stats := watchdog.Stats()
+// stats.PollCount, stats.DriftCount, stats.DroppedCount
+// stats.LastPollAt (time.Time), stats.LastPollDuration (time.Duration)
+// stats.IsRunning, stats.ProbeCount, stats.BaselineCount
 
-fmt.Printf("Polls: %d\n", stats.PollCount)
-fmt.Printf("Drifts: %d\n", stats.DriftCount)
-fmt.Printf("Dropped: %d\n", stats.DroppedCount)
-fmt.Printf("Probes: %d\n", stats.ProbeCount)
-fmt.Printf("Baselines: %d\n", stats.BaselineCount)
-fmt.Printf("Last Poll: %v\n", stats.LastPollTime)
-fmt.Printf("Running: %v\n", stats.IsRunning)
-```
-
-### Health Check
-
-Monitor Cerberus self-health:
-
-```go
 health := watchdog.HealthCheck()
-
-fmt.Printf("Healthy: %v\n", health.Healthy)
-fmt.Printf("Probes: %d\n", health.ProbeCount)
-fmt.Printf("Running: %v\n", health.Running)
-fmt.Printf("Congested: %v\n", health.Congested)
-fmt.Printf("Dropped: %d\n", health.DroppedCount)
+// health.IsHealthy, health.IsRunning, health.ProbeCount
+// health.DroppedEvents, health.BufferCapacity, health.BufferUsed
+// health.LastPollAt, health.LastPollDuration
 ```
+
+`HealthStatus.IsHealthy` is false when `DroppedEvents >= CongestionThreshold`.
 
 ---
 
-## State Persistence
+## Congestion
 
-Cerberus provides hooks for external state persistence, enabling recovery after restart.
+When the drift channel is full, `emitDrift` drops the event and increments
+`Stats.DroppedCount`. When dropped events reach `CongestionThreshold`:
 
-### State Change Hook
+1. `OnCongestion` is called exactly once per congestion episode.
+2. The latch resets automatically when the next event is successfully
+   enqueued and the buffer is no longer at capacity.
+3. A subsequent burst fires `OnCongestion` again.
 
-```go
-watchdog := cerberus.New(cerberus.Config{
-    OnStateChange: func(probeID string, prev *cerberus.State, curr cerberus.State) {
-        // Persist to database, file, or external service
-        db.SaveState(probeID, curr)
-    },
-})
-```
-
-### Load Baseline on Startup
-
-```go
-// Load persisted baseline from external storage
-baseline := map[string]cerberus.State{
-    "file:/etc/passwd": {ResourceID: "/etc/passwd", Hash: 12345},
-    "port:22":          {ResourceID: "22", Hash: 67890},
-}
-
-watchdog.LoadBaseline(baseline)
-watchdog.Start()
-```
-
-### Export Current State
-
-```go
-// Export current baseline for persistence
-currentState := watchdog.ExportState()
-
-// Save to external storage
-json.Marshal(currentState)
-```
+Recommended: always provide an `OnCongestion` handler and monitor
+`Stats.DroppedCount` in your health dashboard.
 
 ---
 
-## Congestion Alerts
+## Stop behaviour
 
-Cerberus can alert when the event buffer is filling up:
-
-```go
-watchdog := cerberus.New(cerberus.Config{
-    CongestionThreshold: 5,
-    OnCongestion: func(droppedCount int64) {
-        alerting.Fire("cerberus_congestion", map[string]any{
-            "dropped": droppedCount,
-        })
-    },
-    EmitCongestionEvent: true, // Also emit as DriftEvent
-})
-
----
-
-## Thread Safety
-
-Cerberus is fully thread-safe:
-
-- ✅ `RegisterProbe()` / `UnregisterProbe()` - Safe during operation
-- ✅ `Start()` / `Stop()` - Idempotent
-- ✅ `Drifts()` channel - Safe for concurrent consumption
-- ✅ `Stats()` - Lock-free atomic reads
-- ✅ `SensitivityProfile` - RWMutex-protected updates
-
----
-
-## Best Practices
-
-### 1. Size Your Buffer
+`Stop()` signals the poll loop to exit and waits up to 5 seconds. If a probe
+is stuck (ignores context cancellation, e.g. a blocked syscall), `Stop()`
+returns `ErrCodeStopTimeout` but still marks the watchdog as stopped. The
+caller decides whether to treat this as fatal.
 
 ```go
-// High-frequency environments: larger buffer
-cerberus.New(cerberus.Config{BufferSize: 256})
-
-// Low-frequency: smaller is fine
-cerberus.New(cerberus.Config{BufferSize: 32})
-```
-
-### 2. Monitor Dropped Events
-
-```go
-go func() {
-    ticker := time.NewTicker(1 * time.Minute)
-    for range ticker.C {
-        stats := watchdog.Stats()
-        if stats.DroppedCount > 0 {
-            log.Warn("events dropped", "count", stats.DroppedCount)
-        }
-    }
-}()
-```
-
-### 3. Use Appropriate Sensitivity
-
-```go
-// Don't over-poll non-critical resources
-profile.SetSensitivity(cerberus.ResourceLog, cerberus.SensitivityLow)
-
-// Critical resources get fast polling
-profile.SetSensitivity(cerberus.ResourceSecret, cerberus.SensitivityCritical)
-```
-
-### 4. Graceful Shutdown
-
-```go
-ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-defer cancel()
-
 if err := watchdog.Stop(); err != nil {
-    log.Error("shutdown failed", "error", err)
+    // At least one probe did not finish cleanly.
+    log.Printf("cerberus stop: %v", err)
 }
 ```
 
 ---
-
-## Performance
-
-### Benchmarks
-
-| Metric | Value |
-|--------|-------|
-| Base tick overhead | ~10μs per tick |
-| Probe scheduling | O(n) per tick |
-| Memory per probe | ~200 bytes |
-| Channel operations | Non-blocking |
-
-### CPU Efficiency
-
-Cerberus uses ticker-based polling, NOT spin loops:
-
-```go
-// ✅ What Cerberus does (CPU-light)
-ticker := time.NewTicker(10 * time.Millisecond)
-for range ticker.C {
-    pollDueProbes()
-}
-
-// ❌ What Cerberus does NOT do (CPU-heavy)
-for {
-    pollAllProbes()  // No sleep = 100% CPU
-}
-```
-
----
-
-## Integration with Themis OS
-
-Cerberus integrates with Themis via the `CerberusAdapter`:
-
-```go
-adapter := orchestrator.NewCerberusAdapter(orchestrator.CerberusAdapterConfig{
-    SensitivityProfile: profile,
-    Handler: func(ctx context.Context, event cerberus.DriftEvent) error {
-        // Route to Themis decision pipeline
-        return orchestrator.ProcessDrift(ctx, event)
-    },
-    Logger:      logger,
-    AuditEngine: auditEngine,
-})
-
-adapter.RegisterProbe(probe)
-adapter.Start()
-```
-
----
-
-## License
-
-Copyright (c) 2025 AGILira - A. Giordano
-
-Licensed under the Mozilla Public License 2.0 (MPL-2.0).
-
----
-
-## Contributing
-
-See [CONTRIBUTING.md](../CONTRIBUTING.md) for guidelines.
 
 ## Security
 
-For security issues, please email security@agilira.com.
+The following threat vectors are covered by `security_test.go`:
+
+| CWE | Vector | Mitigation |
+|---|---|---|
+| CWE-440 | Probe panic | `recover()` in `pollProbe`; converted to `ChangeError`. |
+| CWE-20 | Invalid config (negative intervals, zero buffers) | `applyDefaults()` clamps all fields. |
+| CWE-116 | Injection via probe IDs (newlines, null bytes, path separators) | `ProbeDefinition.Validate()` enforces strict charset. |
+| CWE-354 | Baseline tampering | HMAC-SHA256 + constant-time compare in `VerifyBaseline`. |
+| CWE-400 | Drift storm / buffer flood | Non-blocking channel + drop counter + congestion latch. |
+| CWE-770 | Slow probe DoS | Per-probe `context.WithTimeout`; timed-out probes emit `ChangeError`. |
+| CWE-362 | Race on concurrent register/unregister | `probesMu` RWMutex + double-check before reschedule. |
+
+---
+
+## Thread safety
+
+All public methods are safe to call concurrently. Specifically:
+
+- `RegisterProbe` and `UnregisterProbe` may be called while the watchdog is
+  running. The probe map is protected by `probesMu` (RWMutex).
+- `Stats()` and `HealthCheck()` use lock-free atomic reads.
+- `Drifts()` returns a read-only channel; multiple consumers are safe.
+- `SensitivityProfile` operations are protected by an internal RWMutex.
+
+---
+
+## Copyright
+
+Copyright (c) 2025 AGILira - A. Giordano
+SPDX-License-Identifier: MPL-2.0

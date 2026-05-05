@@ -48,7 +48,8 @@ var (
 	validIDRegex = regexp.MustCompile(`^[a-zA-Z0-9_\-\.]+$`)
 )
 
-// Maximum constraints for adversarial protection
+// Maximum constraints for adversarial protection — used as defaults in ValidationLimits.
+// Override per-factory via NewProbeFactoryWithLimits instead of changing these constants.
 const (
 	MaxProbeIDLength     = 128
 	MaxProbeTargetLength = 1024
@@ -56,13 +57,47 @@ const (
 	MaxMetadataValueLen  = 1024
 )
 
-// Validate checks that the ProbeDefinition is valid and free of obvious adversarial payloads
+// ValidationLimits configures the bounds enforced by ProbeDefinition.ValidateWith.
+// All defaults are intentionally conservative to prevent adversarial payloads.
+// If your workload requires larger metadata (e.g. LLM prompt configs), raise
+// only the specific field you need; leave the others at their defaults.
+type ValidationLimits struct {
+	// MaxIDLength is the maximum byte length of a ProbeDefinition.ID.
+	MaxIDLength int
+	// MaxTargetLength is the maximum byte length of ProbeDefinition.Target.
+	MaxTargetLength int
+	// MaxMetadataKeys is the maximum number of keys in ProbeDefinition.Metadata.
+	MaxMetadataKeys int
+	// MaxMetadataValueLen is the maximum byte length of any single metadata value.
+	MaxMetadataValueLen int
+}
+
+// DefaultValidationLimits returns conservative limits aligned with the package constants.
+// These are the same values enforced by the zero-config Validate() method.
+func DefaultValidationLimits() ValidationLimits {
+	return ValidationLimits{
+		MaxIDLength:         MaxProbeIDLength,
+		MaxTargetLength:     MaxProbeTargetLength,
+		MaxMetadataKeys:     MaxMetadataKeys,
+		MaxMetadataValueLen: MaxMetadataValueLen,
+	}
+}
+
+// Validate checks the ProbeDefinition against the package-default limits.
+// For custom limits use ValidateWith.
 func (d ProbeDefinition) Validate() error {
+	return d.ValidateWith(DefaultValidationLimits())
+}
+
+// ValidateWith checks the ProbeDefinition against caller-supplied limits.
+// Useful when the operator has legitimately higher bounds (e.g. AI metadata)
+// while still blocking obviously adversarial inputs.
+func (d ProbeDefinition) ValidateWith(lim ValidationLimits) error {
 	if d.ID == "" {
 		return fmt.Errorf("probe definition ID cannot be empty")
 	}
-	if len(d.ID) > MaxProbeIDLength {
-		return fmt.Errorf("probe definition ID exceeds maximum length of %d", MaxProbeIDLength)
+	if len(d.ID) > lim.MaxIDLength {
+		return fmt.Errorf("probe definition ID exceeds maximum length of %d", lim.MaxIDLength)
 	}
 	if !validIDRegex.MatchString(d.ID) {
 		return fmt.Errorf("probe definition ID contains invalid characters: must match ^[a-zA-Z0-9_\\-\\.]+$")
@@ -71,17 +106,17 @@ func (d ProbeDefinition) Validate() error {
 	if d.Target == "" {
 		return fmt.Errorf("probe definition target cannot be empty")
 	}
-	if len(d.Target) > MaxProbeTargetLength {
-		return fmt.Errorf("probe definition target exceeds maximum length of %d", MaxProbeTargetLength)
+	if len(d.Target) > lim.MaxTargetLength {
+		return fmt.Errorf("probe definition target exceeds maximum length of %d", lim.MaxTargetLength)
 	}
 
 	if d.Metadata != nil {
-		if len(d.Metadata) > MaxMetadataKeys {
-			return fmt.Errorf("probe metadata exceeds maximum allowed keys (%d)", MaxMetadataKeys)
+		if len(d.Metadata) > lim.MaxMetadataKeys {
+			return fmt.Errorf("probe metadata exceeds maximum allowed keys (%d)", lim.MaxMetadataKeys)
 		}
 		for k, v := range d.Metadata {
-			if len(v) > MaxMetadataValueLen {
-				return fmt.Errorf("probe metadata value for key %q exceeds maximum length (%d)", k, MaxMetadataValueLen)
+			if len(v) > lim.MaxMetadataValueLen {
+				return fmt.Errorf("probe metadata value for key %q exceeds maximum length (%d)", k, lim.MaxMetadataValueLen)
 			}
 		}
 	}
@@ -94,12 +129,25 @@ func (d ProbeDefinition) Validate() error {
 type ProbeFactory struct {
 	mu         sync.RWMutex
 	generators map[ResourceType]ProbeGenerator
+	limits     ValidationLimits
 }
 
-// NewProbeFactory creates a new ProbeFactory
+// NewProbeFactory creates a ProbeFactory with default validation limits.
 func NewProbeFactory() *ProbeFactory {
 	return &ProbeFactory{
 		generators: make(map[ResourceType]ProbeGenerator),
+		limits:     DefaultValidationLimits(),
+	}
+}
+
+// NewProbeFactoryWithLimits creates a ProbeFactory with caller-supplied validation limits.
+// Use this when the default limits are too restrictive for your workload (e.g. large AI
+// metadata payloads). Only raise the specific field you need; leave the others at their
+// defaults by starting from DefaultValidationLimits() and overriding fields.
+func NewProbeFactoryWithLimits(limits ValidationLimits) *ProbeFactory {
+	return &ProbeFactory{
+		generators: make(map[ResourceType]ProbeGenerator),
+		limits:     limits,
 	}
 }
 
@@ -121,7 +169,7 @@ func (f *ProbeFactory) HasGenerator(rt ResourceType) bool {
 
 // CreateProbe creates a single probe from a definition
 func (f *ProbeFactory) CreateProbe(ctx context.Context, def ProbeDefinition) (Probe, error) {
-	if err := def.Validate(); err != nil {
+	if err := def.ValidateWith(f.limits); err != nil {
 		return nil, fmt.Errorf("invalid probe definition: %w", err)
 	}
 

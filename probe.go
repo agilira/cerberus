@@ -45,50 +45,38 @@ const (
 	ResourceCerberus // Cerberus itself (congestion, health)
 )
 
-// String returns human-readable resource type name
+// resourceTypeNames maps ResourceType constants (iota-ordered) to their
+// canonical string representation. The lookup is O(1) and keeps cyclomatic
+// complexity of String() at 1 regardless of how many types are added.
+// WHY not a switch: a 19-branch switch is untestable at each branch; a table
+// is verified by a single bounds check and one array lookup.
+var resourceTypeNames = [...]string{
+	ResourceFile:           "file",
+	ResourcePort:           "port",
+	ResourceProcess:        "process",
+	ResourceLog:            "log",
+	ResourceContainer:      "container",
+	ResourceCertificate:    "certificate",
+	ResourceDNS:            "dns",
+	ResourceIAMPolicy:      "iam_policy",
+	ResourceNetworkRule:    "network_rule",
+	ResourceSecret:         "secret",
+	ResourceService:        "service",
+	ResourceEndpoint:       "endpoint",
+	ResourceCustom:         "custom",
+	ResourceModelWeight:    "model_weight",
+	ResourcePromptTemplate: "prompt_template",
+	ResourceEnvVar:         "env_var",
+	ResourceAgentConfig:    "agent_config",
+	ResourceCerberus:       "cerberus",
+}
+
+// String returns the canonical string representation of the resource type.
 func (r ResourceType) String() string {
-	switch r {
-	case ResourceFile:
-		return "file"
-	case ResourcePort:
-		return "port"
-	case ResourceProcess:
-		return "process"
-	case ResourceLog:
-		return "log"
-	case ResourceContainer:
-		return "container"
-	case ResourceCertificate:
-		return "certificate"
-	case ResourceDNS:
-		return "dns"
-	case ResourceIAMPolicy:
-		return "iam_policy"
-	case ResourceNetworkRule:
-		return "network_rule"
-	case ResourceSecret:
-		return "secret"
-	case ResourceService:
-		return "service"
-	case ResourceEndpoint:
-		return "endpoint"
-	case ResourceCustom:
-		return "custom"
-	// AI-Specific Resources
-	case ResourceModelWeight:
-		return "model_weight"
-	case ResourcePromptTemplate:
-		return "prompt_template"
-	case ResourceEnvVar:
-		return "env_var"
-	case ResourceAgentConfig:
-		return "agent_config"
-	// Meta-Resources
-	case ResourceCerberus:
-		return "cerberus"
-	default:
-		return "unknown"
+	if int(r) < len(resourceTypeNames) {
+		return resourceTypeNames[r]
 	}
+	return "unknown"
 }
 
 // ChangeType identifies what kind of change was detected

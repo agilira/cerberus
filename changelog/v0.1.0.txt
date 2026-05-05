@@ -1,0 +1,75 @@
+v0.1.0 — 2026-05-05
+
+First public release.
+
+FEATURES
+
+  - Drift detection watchdog with configurable probe registry.
+  - Priority queue scheduler: O(log n) reschedule per probe, O(k) work per
+    tick. Base ticker goroutine; no per-probe goroutines at rest.
+  - 18 built-in ResourceType constants with default sensitivity profiles
+    (Critical 100ms / High 500ms / Medium 1s / Low 5s).
+  - SensitivityProfile: per-resource polling interval override with
+    10ms floor (MinPollInterval).
+  - Non-blocking emitDrift: full channel drops events; DroppedCount
+    increments atomically; congestion latch fires OnCongestion exactly
+    once per episode and resets on drain.
+  - Context-aware probe execution: configurable ProbeTimeout cancels
+    hung probes without blocking other probes (CWE-770).
+  - Panic recovery in pollProbe: panicking probes emit ChangeError instead
+    of crashing the host process (CWE-440).
+  - Hot registration: RegisterProbe and UnregisterProbe are safe to call
+    while the watchdog is running. Double-check in scheduler prevents
+    resurrection of probes removed during a poll cycle.
+  - Stop timeout: Stop() returns ErrCodeStopTimeout after 5s if a probe
+    goroutine does not finish; watchdog is still marked stopped.
+  - State persistence hooks: OnStateChange callback, LoadBaseline, ExportState.
+  - Baseline integrity: SignBaseline / VerifyBaseline using HMAC-SHA256
+    with constant-time comparison (CWE-354).
+  - ProbeFactory: runtime probe generation from ProbeDefinition values with
+    strict ID validation (^[a-zA-Z0-9_\-\.]+$, CWE-116).
+  - HealthCheck() and Stats() with lock-free atomic reads (LastPollAt,
+    LastPollDuration replacing the previously racy LastPollTime map).
+  - Self-health probe type (ResourceCerberus) for watchdog-in-watchdog use.
+
+BUG FIXES (pre-release, relative to initial prototype)
+
+  B.1 — RegisterProbe and UnregisterProbe incorrectly rejected calls while
+        the watchdog was running. Guard removed; map access serialised via
+        probesMu RWMutex. Scheduler resurrection race fixed with double-check.
+
+  B.2 — LastPollTime in HealthStatus always returned time.Now() (live clock,
+        not the time of the last actual poll). Replaced with atomic int64
+        (unix nanoseconds); zero value correctly returns time.Time{} instead
+        of the Unix epoch.
+
+  B.3 — Dead lastPollAt map and lastPollAtMu mutex were updated on every poll
+        but never read. Removed; the atomic fields from B.2 are the sole
+        source of truth.
+
+  B.4 — Congestion alert latch (congestionAlerted) was never reset after the
+        channel drained. A single congestion episode permanently silenced
+        future alerts. Latch now resets when the next event enqueues
+        successfully and the buffer is below capacity.
+
+  F.3 — Stop() returned nil even when the shutdown timed out, giving the
+        caller no signal that probes were still running. Now returns
+        ErrCodeStopTimeout on timeout; running flag is cleared regardless.
+
+SECURITY
+
+  - security_test.go covers CWE-440, CWE-20, CWE-116, CWE-354, CWE-400,
+    CWE-770, CWE-362 with dedicated TestSecurity_* functions.
+  - FuzzSensitivityIntervals, FuzzResourceTypeString, FuzzProbeIDValidation
+    fuzz targets included.
+  - Race detector (-race) enabled on all test targets.
+
+DEPENDENCIES
+
+  - github.com/agilira/go-errors v1.1.1 (only non-stdlib dependency).
+
+COMPATIBILITY
+
+  - Go 1.22+ required (uses range-over-integer).
+  - Module path: github.com/agilira/cerberus.
+  - License: MPL-2.0.

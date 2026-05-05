@@ -24,6 +24,8 @@ const (
 
 // Error codes for Cerberus operations
 const (
+	ErrCodeStopTimeout    = "CERBERUS_STOP_TIMEOUT"
+	ErrCodeCompromised    = "CERBERUS_COMPROMISED"
 	ErrCodeNilProbe       = "CERBERUS_NIL_PROBE"
 	ErrCodeDuplicateProbe = "CERBERUS_DUPLICATE_PROBE"
 	ErrCodeProbeNotFound  = "CERBERUS_PROBE_NOT_FOUND"
@@ -43,9 +45,8 @@ type CongestionHandler func(droppedCount int64)
 
 // Config configures Cerberus behavior
 type Config struct {
-	// PollInterval is the base polling interval (used if SensitivityProfile is nil)
-	// Default: 500ms
-	// SOVEREIGNTY: Let policy/user decide CPU vs detection speed tradeoff
+	// Deprecated: PollInterval is accepted for backward compatibility but has no
+	// effect. Use SensitivityProfile to control polling frequency.
 	PollInterval time.Duration
 
 	// BufferSize is the drift event channel buffer size
@@ -82,9 +83,6 @@ type Config struct {
 
 // applyDefaults returns config with defaults applied for invalid values
 func (c Config) applyDefaults() Config {
-	if c.PollInterval <= 0 {
-		c.PollInterval = DefaultPollInterval
-	}
 	if c.BufferSize <= 0 {
 		c.BufferSize = DefaultBufferSize
 	}
@@ -102,24 +100,28 @@ func (c Config) applyDefaults() Config {
 
 // Stats contains runtime statistics
 type Stats struct {
-	PollCount     int64         // Total polls executed
-	DriftCount    int64         // Total drifts detected
-	DroppedCount  int64         // Events dropped due to full buffer
-	ProbeCount    int           // Number of registered probes
-	LastPollTime  time.Duration // Duration of last poll cycle
-	IsRunning     bool          // Whether watchdog is running
-	BaselineCount int           // Number of baseline entries loaded
+	PollCount        int64         // Total polls executed
+	DriftCount       int64         // Total drifts detected
+	DroppedCount     int64         // Events dropped due to full buffer
+	OverrunCount     int64         // Poll cycles that exceeded MinPollInterval (sequential bottleneck signal)
+	ProbeCount       int           // Number of registered probes
+	LastPollAt       time.Time     // Wall-clock time when the last poll cycle completed
+	LastPollDuration time.Duration // Duration of the last poll cycle
+	IsRunning        bool          // Whether watchdog is running
+	BaselineCount    int           // Number of baseline entries loaded
 }
 
 // HealthStatus contains health check information
 type HealthStatus struct {
-	IsHealthy      bool      // True if watchdog is operating normally
-	IsRunning      bool      // Whether watchdog is running
-	ProbeCount     int       // Number of registered probes
-	DroppedEvents  int64     // Number of dropped events
-	BufferCapacity int       // Size of drift event buffer
-	BufferUsed     int       // Current buffer usage (approximate)
-	LastPollTime   time.Time // When last poll completed
+	IsHealthy        bool          // True if watchdog is operating normally
+	IsRunning        bool          // Whether watchdog is running
+	ProbeCount       int           // Number of registered probes
+	DroppedEvents    int64         // Number of dropped events
+	BufferCapacity   int           // Size of drift event buffer
+	BufferUsed       int           // Current buffer usage (approximate)
+	LastPollAt       time.Time     // When last poll cycle completed (zero if never polled)
+	LastPollDuration time.Duration // Duration of the last poll cycle
+	PollOverrun      bool          // True if the last poll cycle exceeded MinPollInterval (sequential bottleneck)
 }
 
 // Cerberus is a lightweight drift detection watchdog
@@ -142,10 +144,6 @@ type Cerberus struct {
 	lastState   map[string]State
 	lastStateMu sync.RWMutex
 
-	// Last poll time per probe for sensitivity-based scheduling
-	lastPollAt   map[string]time.Time
-	lastPollAtMu sync.RWMutex
-
 	// Drift event channel (Themis OS consumes this)
 	drifts chan DriftEvent
 
@@ -158,8 +156,22 @@ type Cerberus struct {
 	pollCount         atomic.Int64
 	driftCount        atomic.Int64
 	droppedCount      atomic.Int64
-	lastPollTime      atomic.Int64 // nanoseconds
+	lastPollAt        atomic.Int64 // unix nanoseconds of last poll-cycle completion
+	lastPollDuration  atomic.Int64 // nanoseconds spent in last poll cycle
 	congestionAlerted atomic.Bool  // Whether congestion alert was fired
+
+	// WHY overrunCount: sequential probe execution means a large due-set can
+	// push the poll cycle past MinPollInterval, causing the ticker to fire
+	// before the previous cycle finishes. Callers that observe a rising
+	// OverrunCount should reduce probe count, increase sensitivity intervals,
+	// or plan a future worker-pool upgrade.
+	overrunCount atomic.Int64
+
+	// WHY compromised: if Stop() times out, the pollLoop goroutine is still
+	// running. Allowing Start() after a timeout would spawn a second pollLoop
+	// on the same channels, creating a goroutine leak. The compromised flag
+	// prevents restart; the caller must create a new Cerberus instance.
+	compromised atomic.Bool
 }
 
 // New creates a new Cerberus watchdog
@@ -172,22 +184,22 @@ func New(config Config) *Cerberus {
 		probes:             make(map[string]Probe),
 		scheduler:          NewProbeScheduler(),
 		lastState:          make(map[string]State),
-		lastPollAt:         make(map[string]time.Time),
 		drifts:             make(chan DriftEvent, cfg.BufferSize),
 		stopCh:             make(chan struct{}),
 		doneCh:             make(chan struct{}),
 	}
 }
 
-// RegisterProbe adds a probe to the watchdog
-// Cannot be called while running
+// RegisterProbe adds a probe to the watchdog.
+// Safe to call while running — the internal probesMu write-lock and the
+// scheduler's own mutex provide all required concurrency protection.
+// WHY no running-guard: the probes map and scheduler are mutex-protected;
+// blocking mid-run registration would prevent dynamic lifecycle consumers
+// (ADR-017 skills watcher, auto-protect) from working without a
+// disruptive Stop→Register→Start cycle that resets all other probes.
 func (c *Cerberus) RegisterProbe(probe Probe) error {
 	if probe == nil {
 		return errors.New(ErrCodeNilProbe, "probe cannot be nil")
-	}
-
-	if c.running.Load() {
-		return errors.New(ErrCodeProbeWhileRun, "cannot register probe while running")
 	}
 
 	c.probesMu.Lock()
@@ -200,20 +212,15 @@ func (c *Cerberus) RegisterProbe(probe Probe) error {
 	}
 
 	c.probes[id] = probe
-
-	// Schedule for immediate polling on start
 	c.scheduler.ScheduleNow(id)
-
 	return nil
 }
 
-// UnregisterProbe removes a probe from the watchdog
-// Cannot be called while running
+// UnregisterProbe removes a probe from the watchdog.
+// Safe to call while running — same rationale as RegisterProbe.
+// The scheduler removal and lastState cleanup are performed inside the
+// probesMu write-lock so that pollDueProbes sees a consistent view.
 func (c *Cerberus) UnregisterProbe(id string) error {
-	if c.running.Load() {
-		return errors.New(ErrCodeProbeWhileRun, "cannot unregister probe while running")
-	}
-
 	c.probesMu.Lock()
 	defer c.probesMu.Unlock()
 
@@ -223,11 +230,10 @@ func (c *Cerberus) UnregisterProbe(id string) error {
 	}
 
 	delete(c.probes, id)
-
-	// Remove from scheduler
 	c.scheduler.Remove(id)
 
-	// Clean up last state
+	// Clean up baseline state so a future re-registration with the same
+	// ID starts with a clean slate rather than a stale hash.
 	c.lastStateMu.Lock()
 	delete(c.lastState, id)
 	c.lastStateMu.Unlock()
@@ -235,8 +241,16 @@ func (c *Cerberus) UnregisterProbe(id string) error {
 	return nil
 }
 
-// Start begins the polling loop
+// Start begins the polling loop.
+// Returns ErrCodeCompromised if a previous Stop() timed out — in that case
+// the pollLoop goroutine may still be running and this instance must not be
+// restarted. Create a new Cerberus via New() instead.
 func (c *Cerberus) Start() error {
+	if c.compromised.Load() {
+		return errors.New(ErrCodeCompromised,
+			"cerberus instance is compromised: a previous Stop() timed out; "+
+				"create a new instance via New() instead of restarting this one")
+	}
 	if c.running.Swap(true) {
 		return errors.New(ErrCodeAlreadyRunning, "cerberus is already running")
 	}
@@ -250,7 +264,11 @@ func (c *Cerberus) Start() error {
 	return nil
 }
 
-// Stop halts the polling loop gracefully
+// Stop halts the polling loop gracefully.
+// Returns ErrCodeStopTimeout if the poll loop does not exit within 5 seconds.
+// WHY: a stuck probe (network hang, broken filesystem) can block pollProbe
+// indefinitely even with a timeout context if the probe ignores cancellation.
+// Returning an error lets callers log or alert without a silent hang at shutdown.
 func (c *Cerberus) Stop() error {
 	if !c.running.Load() {
 		return errors.New(ErrCodeNotRunning, "cerberus is not running")
@@ -258,16 +276,22 @@ func (c *Cerberus) Stop() error {
 
 	close(c.stopCh)
 
-	// Wait for poll loop to finish with timeout
+	// Wait for poll loop to finish with timeout.
+	// Mark stopped regardless of outcome so IsRunning() is truthful.
+	var stopErr error
 	select {
 	case <-c.doneCh:
-		// Clean shutdown
+		// Clean shutdown.
 	case <-time.After(5 * time.Second):
-		// Timeout - force stop
+		// A probe is stuck and ignored context cancellation. Mark the instance
+		// compromised so Start() refuses to spawn a second pollLoop goroutine
+		// on top of the one that is still running (goroutine leak prevention).
+		c.compromised.Store(true)
+		stopErr = errors.New(ErrCodeStopTimeout, "poll loop did not stop within 5s; a probe may be stuck")
 	}
 
 	c.running.Store(false)
-	return nil
+	return stopErr
 }
 
 // IsRunning returns whether the watchdog is active
@@ -281,6 +305,16 @@ func (c *Cerberus) Drifts() <-chan DriftEvent {
 	return c.drifts
 }
 
+// pollAtToTime converts a stored unix-nanosecond value to a time.Time.
+// Returns the zero value when val is 0 (i.e. no poll has completed yet),
+// which lets callers distinguish "never polled" from the Unix epoch.
+func pollAtToTime(val int64) time.Time {
+	if val == 0 {
+		return time.Time{}
+	}
+	return time.Unix(0, val)
+}
+
 // Stats returns runtime statistics
 func (c *Cerberus) Stats() Stats {
 	c.probesMu.RLock()
@@ -292,13 +326,15 @@ func (c *Cerberus) Stats() Stats {
 	c.lastStateMu.RUnlock()
 
 	return Stats{
-		PollCount:     c.pollCount.Load(),
-		DriftCount:    c.driftCount.Load(),
-		DroppedCount:  c.droppedCount.Load(),
-		ProbeCount:    probeCount,
-		LastPollTime:  time.Duration(c.lastPollTime.Load()),
-		IsRunning:     c.running.Load(),
-		BaselineCount: baselineCount,
+		PollCount:        c.pollCount.Load(),
+		DriftCount:       c.driftCount.Load(),
+		DroppedCount:     c.droppedCount.Load(),
+		OverrunCount:     c.overrunCount.Load(),
+		ProbeCount:       probeCount,
+		LastPollAt:       pollAtToTime(c.lastPollAt.Load()),
+		LastPollDuration: time.Duration(c.lastPollDuration.Load()),
+		IsRunning:        c.running.Load(),
+		BaselineCount:    baselineCount,
 	}
 }
 
@@ -347,6 +383,18 @@ func (c *Cerberus) pollDueProbes() {
 		c.pollProbe(probe)
 		pollCount++
 
+		// WHY re-check existence before rescheduling: UnregisterProbe may
+		// have been called concurrently between the exists-check above and
+		// here. Re-adding a removed probe to the scheduler would resurrect
+		// it silently (CWE-362 race window). The extra RLock is cheap
+		// compared to the correctness guarantee.
+		c.probesMu.RLock()
+		_, stillExists := c.probes[probeID]
+		c.probesMu.RUnlock()
+		if !stillExists {
+			continue
+		}
+
 		// Reschedule for next poll based on sensitivity interval
 		interval := c.sensitivityProfile.GetInterval(probe.ResourceType())
 		nextPoll := start.Add(interval)
@@ -355,18 +403,22 @@ func (c *Cerberus) pollDueProbes() {
 
 	if pollCount > 0 {
 		c.pollCount.Add(1)
-		c.lastPollTime.Store(int64(time.Since(start)))
+		elapsed := time.Since(start)
+		c.lastPollAt.Store(time.Now().UnixNano())
+		c.lastPollDuration.Store(int64(elapsed))
+		// WHY overrunCount: if a poll cycle takes longer than MinPollInterval the
+		// ticker fires while we are still executing, which silently defers the
+		// next cycle and skews drift timestamps. Counting overruns gives callers
+		// an observable signal before it becomes a reliability problem.
+		if elapsed > MinPollInterval {
+			c.overrunCount.Add(1)
+		}
 	}
 }
 
 // pollProbe executes a single probe and checks for drift
 func (c *Cerberus) pollProbe(probe Probe) {
 	probeID := probe.ID()
-
-	// Record poll time FIRST for accurate scheduling
-	c.lastPollAtMu.Lock()
-	c.lastPollAt[probeID] = time.Now()
-	c.lastPollAtMu.Unlock()
 
 	// Execute probe with timeout context
 	ctx, cancel := context.WithTimeout(context.Background(), c.config.ProbeTimeout)
@@ -375,7 +427,7 @@ func (c *Cerberus) pollProbe(probe Probe) {
 	// Implement CWE-440 mitigation: Global panic isolation
 	var state State
 	var err error
-	
+
 	func() {
 		defer func() {
 			if r := recover(); r != nil {
@@ -443,19 +495,33 @@ func (c *Cerberus) pollProbe(probe Probe) {
 	c.lastStateMu.Unlock()
 }
 
-// emitDrift sends a drift event to the channel
-// Non-blocking: drops event if buffer is full
+// emitDrift sends a drift event to the channel.
+// Non-blocking: drops event if buffer is full.
+// WHY drain-reset: congestionAlerted is a one-shot latch that prevents alert
+// storms while the buffer is full. We reset it when an event is successfully
+// enqueued AND the buffer was empty before the send, meaning the consumer had
+// fully caught up. This "full drain" semantic works correctly for any
+// BufferSize >= 1, unlike the previous "len < cap" check which failed for
+// BufferSize=1 (len always equals cap after any enqueue).
 func (c *Cerberus) emitDrift(event DriftEvent) {
+	// Capture occupancy before the send. If zero, the consumer has fully
+	// drained the backlog; a successful send confirms re-arm is safe.
+	preLen := len(c.drifts)
 	select {
 	case c.drifts <- event:
 		c.driftCount.Add(1)
+		// Reset the congestion latch only when the buffer was empty at send
+		// time, signalling the consumer pareggiato.
+		if c.congestionAlerted.Load() && preLen == 0 {
+			c.congestionAlerted.Store(false)
+		}
 	default:
-		// Buffer full - drop event and count
+		// Buffer full — drop event and count.
 		dropped := c.droppedCount.Add(1)
 
-		// Check congestion threshold
+		// Fire the congestion callback exactly once per congestion episode.
+		// The latch is cleared above when the buffer drains, allowing re-fire.
 		if dropped >= c.config.CongestionThreshold {
-			// Only alert once per congestion episode
 			if c.congestionAlerted.CompareAndSwap(false, true) {
 				if c.config.OnCongestion != nil {
 					c.config.OnCongestion(dropped)
@@ -499,13 +565,17 @@ func (c *Cerberus) HealthCheck() HealthStatus {
 	dropped := c.droppedCount.Load()
 	isHealthy := dropped < c.config.CongestionThreshold
 
+	lastDuration := time.Duration(c.lastPollDuration.Load())
+
 	return HealthStatus{
-		IsHealthy:      isHealthy,
-		IsRunning:      c.running.Load(),
-		ProbeCount:     probeCount,
-		DroppedEvents:  dropped,
-		BufferCapacity: c.config.BufferSize,
-		BufferUsed:     len(c.drifts),
-		LastPollTime:   time.Now(), // Approximate
+		IsHealthy:        isHealthy,
+		IsRunning:        c.running.Load(),
+		ProbeCount:       probeCount,
+		DroppedEvents:    dropped,
+		BufferCapacity:   c.config.BufferSize,
+		BufferUsed:       len(c.drifts),
+		LastPollAt:       pollAtToTime(c.lastPollAt.Load()),
+		LastPollDuration: lastDuration,
+		PollOverrun:      lastDuration > MinPollInterval,
 	}
 }

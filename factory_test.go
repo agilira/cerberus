@@ -326,3 +326,88 @@ func (p *genericProbe) Probe(ctx context.Context) (State, error) {
 		Metadata:   p.def.Metadata,
 	}, nil
 }
+
+// =============================================================================
+// VALIDATION LIMITS TESTS
+// =============================================================================
+
+// TestValidationLimits_DefaultsMatchConstants ensures DefaultValidationLimits()
+// is in sync with the exported constants so callers who start from the defaults
+// and tweak a single field get the expected base values.
+func TestValidationLimits_DefaultsMatchConstants(t *testing.T) {
+	lim := DefaultValidationLimits()
+	if lim.MaxIDLength != MaxProbeIDLength {
+		t.Errorf("MaxIDLength: got %d, want %d", lim.MaxIDLength, MaxProbeIDLength)
+	}
+	if lim.MaxTargetLength != MaxProbeTargetLength {
+		t.Errorf("MaxTargetLength: got %d, want %d", lim.MaxTargetLength, MaxProbeTargetLength)
+	}
+	if lim.MaxMetadataKeys != MaxMetadataKeys {
+		t.Errorf("MaxMetadataKeys: got %d, want %d", lim.MaxMetadataKeys, MaxMetadataKeys)
+	}
+	if lim.MaxMetadataValueLen != MaxMetadataValueLen {
+		t.Errorf("MaxMetadataValueLen: got %d, want %d", lim.MaxMetadataValueLen, MaxMetadataValueLen)
+	}
+}
+
+// TestValidateWith_CustomMetadataLimit verifies that a factory created with
+// raised metadata limits accepts definitions that would be rejected by the
+// default factory. This is the primary use-case for NewProbeFactoryWithLimits:
+// large AI workloads where metadata payloads exceed the conservative defaults.
+func TestValidateWith_CustomMetadataLimit(t *testing.T) {
+	// Build a def with 60 metadata keys — over the default of 50.
+	def := ProbeDefinition{
+		ID:       "ai-probe",
+		Target:   "/model/weights",
+		Metadata: make(map[string]string, 60),
+	}
+	for i := range 60 {
+		def.Metadata["key-"+string(rune('a'+i%26))+string(rune('0'+i%10))] = "value"
+	}
+
+	// Default factory must reject it.
+	defaultFactory := NewProbeFactory()
+	if err := def.ValidateWith(defaultFactory.limits); err == nil {
+		t.Fatal("default factory should reject >50 metadata keys")
+	}
+
+	// Custom factory with raised limit must accept it.
+	lim := DefaultValidationLimits()
+	lim.MaxMetadataKeys = 100
+	customFactory := NewProbeFactoryWithLimits(lim)
+	if err := def.ValidateWith(customFactory.limits); err != nil {
+		t.Errorf("custom factory rejected a valid definition: %v", err)
+	}
+}
+
+// TestNewProbeFactoryWithLimits_CreateProbe verifies the full path through
+// CreateProbe, not just the limit struct. The factory must use its configured
+// limits when validating each definition.
+func TestNewProbeFactoryWithLimits_CreateProbe(t *testing.T) {
+	gen := func(ctx context.Context, def ProbeDefinition) (Probe, error) {
+		return &genericProbe{def: def}, nil
+	}
+
+	// A definition with a 200-character ID — over the default MaxProbeIDLength of 128.
+	longID := ""
+	for range 200 {
+		longID += "a"
+	}
+	def := ProbeDefinition{ID: longID, ResourceType: ResourceFile, Target: "/tmp/f"}
+
+	// Default factory must refuse it.
+	defaultF := NewProbeFactory()
+	defaultF.RegisterGenerator(ResourceFile, gen)
+	if _, err := defaultF.CreateProbe(context.Background(), def); err == nil {
+		t.Fatal("default factory should reject ID > 128 chars")
+	}
+
+	// Custom factory with larger ID limit must accept it.
+	lim := DefaultValidationLimits()
+	lim.MaxIDLength = 256
+	customF := NewProbeFactoryWithLimits(lim)
+	customF.RegisterGenerator(ResourceFile, gen)
+	if _, err := customF.CreateProbe(context.Background(), def); err != nil {
+		t.Errorf("custom factory rejected valid long ID: %v", err)
+	}
+}

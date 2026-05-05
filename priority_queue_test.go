@@ -48,7 +48,7 @@ func TestCerberus_PollLoop_Scalability(t *testing.T) {
 
 	stats := c.Stats()
 	t.Logf("Poll count: %d", stats.PollCount)
-	t.Logf("Last poll time: %v", time.Duration(c.lastPollTime.Load()))
+	t.Logf("Last poll duration: %v", time.Duration(c.lastPollDuration.Load()))
 	t.Logf("Registered probes: %d", stats.ProbeCount)
 
 	// Measure actual scaling behavior

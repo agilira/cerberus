@@ -1,80 +1,95 @@
-// cerberus: Lightweight drift detection watchdog for Themis Security OS
+// Package cerberus implements a lightweight, CPU-efficient drift detection watchdog.
 //
-// Philosophy:
-// - Detect, don't act (SOC separation of concerns)
-// - CPU-light polling (ticker + sleep, no spin loops)
-// - Zero external dependencies beyond go-errors
-// - Pluggable probes for any resource type
-// - Thread-safe, race-free design
-// - Context-aware probes with timeout support
-// - Self-health monitoring and congestion alerts
-// - State persistence hooks for restart recovery
+// # Design Principles
 //
-// Cerberus watches system state via configurable Probes and barks (emits DriftEvents)
-// when drift is detected. It does NOT take action - that's Themis OS's job via
-// Policy → RBAC → WorldModel → Reconciler → Reflex chain.
+// Cerberus detects — it never acts. Every state change is emitted as a [DriftEvent]
+// on a buffered channel; what to do with that information is the caller's concern.
+// This separation keeps Cerberus auditable, testable, and safe to embed in any
+// security-critical process without hidden side effects.
 //
-// # Configuration
+// Additional design constraints:
+//   - Zero external dependencies beyond github.com/agilira/go-errors.
+//   - CPU-light: one base ticker goroutine; probes polled via a priority queue.
+//   - Context-aware: every probe call is bounded by a configurable ProbeTimeout.
+//   - Panic-safe: a panicking probe emits ChangeError and does NOT crash the host.
+//   - Thread-safe: [RegisterProbe] and [UnregisterProbe] are safe to call while
+//     the watchdog is running.
 //
-// Key configuration options:
-//   - PollInterval: Base polling frequency (default 500ms)
-//   - BufferSize: Drift channel buffer (default 64)
-//   - ProbeTimeout: Max probe execution time (default 1s)
-//   - SensitivityProfile: Per-resource polling intervals
-//   - OnStateChange: Hook for state persistence
-//   - CongestionThreshold: Dropped events trigger for alert (default 10)
-//   - OnCongestion: Handler for congestion alerts
-//
-// # Resource Types
-//
-// Cerberus supports diverse resource monitoring including:
-//   - Infrastructure: File, Port, Process, Service, Container
-//   - Security: Secret, Certificate, IAMPolicy, NetworkRule
-//   - AI-Specific: ModelWeight, PromptTemplate, EnvVar, AgentConfig
-//   - Meta: Cerberus (self-health monitoring)
-//
-// # State Persistence
-//
-// For restart recovery, use the persistence hooks:
-//   - OnStateChange: Called on every probe state change
-//   - LoadBaseline: Restore state from external storage
-//   - ExportState: Export current state for persistence
-//
-// Example Usage:
+// # Quick start
 //
 //	watchdog := cerberus.New(cerberus.Config{
-//	    PollInterval:        500 * time.Millisecond,
-//	    BufferSize:          64,
-//	    ProbeTimeout:        1 * time.Second,
-//	    CongestionThreshold: 10,
-//	    OnStateChange: func(probeID string, prev *State, curr State) {
-//	        db.SaveState(probeID, curr)
+//	    BufferSize:   64,
+//	    ProbeTimeout: time.Second,
+//	    OnStateChange: func(id string, prev, curr *cerberus.State) {
+//	        // persist curr to external storage for restart recovery
 //	    },
 //	})
 //
-//	// Restore baseline from persistence
-//	watchdog.LoadBaseline(db.LoadAllStates())
+//	if err := watchdog.RegisterProbe(myProbe); err != nil {
+//	    log.Fatal(err)
+//	}
+//	if err := watchdog.Start(); err != nil {
+//	    log.Fatal(err)
+//	}
+//	defer func() {
+//	    if err := watchdog.Stop(); err != nil {
+//	        log.Println("cerberus stop:", err) // may be ErrCodeStopTimeout
+//	    }
+//	}()
 //
-//	// Register probes
-//	watchdog.RegisterProbe(myFileProbe)
-//	watchdog.RegisterProbe(myPortProbe)
-//
-//	// Start watching
-//	watchdog.Start()
-//	defer watchdog.Stop()
-//
-//	// Consume drift events (Themis OS handles these)
-//	for drift := range watchdog.Drifts() {
-//	    orchestrator.HandleDrift(drift)
+//	for event := range watchdog.Drifts() {
+//	    handleDrift(event)
 //	}
 //
-//	// Check health
-//	health := watchdog.HealthCheck()
-//	if !health.Healthy {
-//	    log.Warn("Cerberus degraded", "congested", health.Congested)
+// # Configuration
+//
+// [Config] controls all runtime behaviour. Passing a zero value is safe — defaults
+// are applied by [New] via Config.applyDefaults():
+//
+//   - BufferSize (default 64): capacity of the drift event channel.
+//   - ProbeTimeout (default 1s): maximum time a single probe may run.
+//   - CongestionThreshold (default 10): dropped-event count that triggers [Config.OnCongestion].
+//   - SensitivityProfile: per-resource polling intervals (see [SensitivityProfile]).
+//
+// # Probes
+//
+// Any type that satisfies the [Probe] interface can be registered. The interface
+// is intentionally minimal:
+//
+//	type Probe interface {
+//	    ID()           string
+//	    ResourceType() ResourceType
+//	    Probe(context.Context) (State, error)
 //	}
+//
+// Probes are polled at the interval returned by [SensitivityProfile.GetInterval]
+// for their [ResourceType]. The default intervals range from 100ms
+// ([SensitivityCritical]) to 5s ([SensitivityLow]).
+//
+// # Dynamic probes
+//
+// [ProbeFactory] generates probes at runtime from [ProbeDefinition] values.
+// Register a generator per [ResourceType], then call CreateProbesFromDefinitions
+// to build a batch without restarting the watchdog.
+//
+// # State persistence and restart recovery
+//
+// Cerberus is stateless by design. Persistence is opt-in:
+//   - [Config.OnStateChange]: called on every state transition; persist the new state.
+//   - [Cerberus.LoadBaseline]: restore a saved state map before calling [Cerberus.Start].
+//   - [Cerberus.ExportState]: snapshot the current in-memory state for persistence.
+//
+// # Baseline integrity
+//
+// [SignBaseline] and [VerifyBaseline] provide HMAC-SHA256 protection for persisted
+// state. Tampered baselines are rejected before they can influence drift decisions.
+//
+// # Self-health
+//
+// [Cerberus.HealthCheck] returns [HealthStatus] with live congestion metrics,
+// probe count, and the timestamp/duration of the last poll cycle. [Cerberus.Stats]
+// returns cumulative counters for dashboards and alerting.
 //
 // Copyright (c) 2025 AGILira - A. Giordano
-// Series: an AGILira fragment
 // SPDX-License-Identifier: MPL-2.0
 package cerberus

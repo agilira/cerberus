@@ -184,7 +184,7 @@ func TestHealthStatus_Fields(t *testing.T) {
 		DroppedEvents:  0,
 		BufferCapacity: 64,
 		BufferUsed:     10,
-		LastPollTime:   now,
+		LastPollAt:     now,
 	}
 
 	if !status.IsHealthy {
@@ -205,7 +205,135 @@ func TestHealthStatus_Fields(t *testing.T) {
 	if status.BufferUsed != 10 {
 		t.Error("expected BufferUsed=10")
 	}
-	if !status.LastPollTime.Equal(now) {
-		t.Error("expected LastPollTime to match set value")
+	if !status.LastPollAt.Equal(now) {
+		t.Error("expected LastPollAt to match set value")
+	}
+}
+
+// TestCongestion_RefiresAfterDrain verifies that the congestion alert fires a
+// SECOND time after the drift channel drains below capacity.
+// WHY: congestionAlerted was a one-shot latch — once fired it never reset,
+// so a second burst of drops was silently swallowed (B.4 bug).
+func TestCongestion_RefiresAfterDrain(t *testing.T) {
+	t.Parallel()
+
+	var alertCount atomic.Int32
+
+	c := New(Config{
+		BufferSize:          2,
+		CongestionThreshold: 1,
+		OnCongestion: func(_ int64) {
+			alertCount.Add(1)
+		},
+	})
+
+	// Cause the first congestion episode by filling the buffer with 4 events
+	// (BufferSize=2 → 2 drops → threshold=1 → fires alert).
+	for range 4 {
+		c.emitDrift(DriftEvent{ChangeType: ChangeDrift, Timestamp: time.Now()})
+	}
+
+	if alertCount.Load() < 1 {
+		t.Fatal("first congestion alert never fired")
+	}
+
+	// Drain the channel so the drain-reset triggers on the next successful emit.
+	for len(c.drifts) > 0 {
+		<-c.drifts
+	}
+
+	// Emit one event that succeeds (buffer empty): this should reset the latch.
+	c.emitDrift(DriftEvent{ChangeType: ChangeDrift, Timestamp: time.Now()})
+
+	// Cause a second congestion episode.
+	for range 4 {
+		c.emitDrift(DriftEvent{ChangeType: ChangeDrift, Timestamp: time.Now()})
+	}
+
+	if alertCount.Load() < 2 {
+		t.Fatalf("second congestion alert did not fire (alertCount=%d)", alertCount.Load())
+	}
+}
+
+// TestCongestion_DoesNotRefireWhileStillCongested verifies that the alert does
+// NOT fire repeatedly on each dropped event while the buffer stays full.
+// WHY: the CompareAndSwap gate must hold while congested; the drain-reset only
+// happens when an event succeeds, not while the buffer remains at capacity.
+func TestCongestion_DoesNotRefireWhileStillCongested(t *testing.T) {
+	t.Parallel()
+
+	var alertCount atomic.Int32
+
+	c := New(Config{
+		BufferSize:          2,
+		CongestionThreshold: 1,
+		OnCongestion: func(_ int64) {
+			alertCount.Add(1)
+		},
+	})
+
+	// Fill buffer to capacity first.
+	for range 2 {
+		c.emitDrift(DriftEvent{ChangeType: ChangeDrift, Timestamp: time.Now()})
+	}
+
+	// All subsequent emits should drop but NOT trigger additional alerts.
+	for range 20 {
+		c.emitDrift(DriftEvent{ChangeType: ChangeDrift, Timestamp: time.Now()})
+	}
+
+	count := alertCount.Load()
+	if count != 1 {
+		t.Fatalf("expected exactly 1 alert while congested, got %d", count)
+	}
+}
+
+// TestCongestion_BufferSize1_StillReArms pins the "full drain" re-arm semantic
+// for the degenerate case of BufferSize=1.
+//
+// WHY: the previous reset condition was `len(c.drifts) < cap(c.drifts)`. For
+// BufferSize=1, after any successful enqueue len==cap==1, so the condition was
+// always false: the latch never reset and a second congestion episode was
+// silently swallowed for the lifetime of the process.
+//
+// The fix captures len BEFORE the send (preLen). If preLen==0, the consumer
+// had fully drained the backlog; a successful send means re-arm is safe. This
+// works for BufferSize=1 and is semantically equivalent for BufferSize>1.
+func TestCongestion_BufferSize1_StillReArms(t *testing.T) {
+	t.Parallel()
+
+	var alertCount atomic.Int32
+
+	c := New(Config{
+		BufferSize:          1,
+		CongestionThreshold: 1,
+		OnCongestion: func(_ int64) {
+			alertCount.Add(1)
+		},
+	})
+
+	// First congestion episode: fill the single slot, then drop one event.
+	c.emitDrift(DriftEvent{ChangeType: ChangeDrift, Timestamp: time.Now()}) // fills buffer
+	c.emitDrift(DriftEvent{ChangeType: ChangeDrift, Timestamp: time.Now()}) // drops → alert
+
+	if alertCount.Load() < 1 {
+		t.Fatal("first congestion alert never fired")
+	}
+
+	// Fully drain the channel so preLen==0 on the next send.
+	<-c.drifts
+
+	// Emit one event into the now-empty buffer: preLen==0 → latch resets.
+	c.emitDrift(DriftEvent{ChangeType: ChangeDrift, Timestamp: time.Now()})
+
+	// Drain the re-arm event so the buffer is empty again.
+	<-c.drifts
+
+	// Second congestion episode: fill + drop.
+	c.emitDrift(DriftEvent{ChangeType: ChangeDrift, Timestamp: time.Now()}) // fills buffer
+	c.emitDrift(DriftEvent{ChangeType: ChangeDrift, Timestamp: time.Now()}) // drops → alert
+
+	if alertCount.Load() < 2 {
+		t.Fatalf("second congestion alert did not fire with BufferSize=1 (alertCount=%d)", alertCount.Load())
 	}
 }

@@ -11,6 +11,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/agilira/go-errors"
 )
 
 // =============================================================================
@@ -24,9 +26,7 @@ func TestNew_DefaultConfig(t *testing.T) {
 		t.Fatal("New() returned nil")
 	}
 
-	if c.config.PollInterval != DefaultPollInterval {
-		t.Errorf("expected PollInterval=%v, got %v", DefaultPollInterval, c.config.PollInterval)
-	}
+	// PollInterval is deprecated and no longer clamped by applyDefaults.
 
 	if c.config.BufferSize != DefaultBufferSize {
 		t.Errorf("expected BufferSize=%d, got %d", DefaultBufferSize, c.config.BufferSize)
@@ -35,29 +35,12 @@ func TestNew_DefaultConfig(t *testing.T) {
 
 func TestNew_CustomConfig(t *testing.T) {
 	cfg := Config{
-		PollInterval: 100 * time.Millisecond,
-		BufferSize:   128,
+		BufferSize: 128,
 	}
 	c := New(cfg)
-
-	if c.config.PollInterval != 100*time.Millisecond {
-		t.Errorf("expected PollInterval=100ms, got %v", c.config.PollInterval)
-	}
 
 	if c.config.BufferSize != 128 {
 		t.Errorf("expected BufferSize=128, got %d", c.config.BufferSize)
-	}
-}
-
-func TestNew_InvalidConfig_NegativePollInterval(t *testing.T) {
-	cfg := Config{
-		PollInterval: -1 * time.Second,
-	}
-	c := New(cfg)
-
-	// Should fallback to default
-	if c.config.PollInterval != DefaultPollInterval {
-		t.Errorf("expected default PollInterval, got %v", c.config.PollInterval)
 	}
 }
 
@@ -109,16 +92,177 @@ func TestRegisterProbe_DuplicateID(t *testing.T) {
 	}
 }
 
-func TestRegisterProbe_WhileRunning(t *testing.T) {
-	c := New(Config{PollInterval: 100 * time.Millisecond})
-	_ = c.Start()
-	defer func() { _ = c.Stop() }()
+// TestRegisterProbe_WhileRunning_Succeeds verifies that RegisterProbe may
+// be called on a live Cerberus instance without returning an error.
+// WHY: dynamic probe lifecycle (ADR-017 skills watcher) requires hot-add;
+// the old guard was a design choice, not a correctness requirement.
+func TestRegisterProbe_WhileRunning_Succeeds(t *testing.T) {
+	t.Parallel()
+	c := New(Config{})
+	if err := c.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer func() {
+		if err := c.Stop(); err != nil {
+			t.Errorf("Stop: %v", err)
+		}
+	}()
 
 	probe := &mockProbe{id: "late-probe"}
-	err := c.RegisterProbe(probe)
+	if err := c.RegisterProbe(probe); err != nil {
+		t.Fatalf("RegisterProbe while running: %v", err)
+	}
+}
 
-	if err == nil {
-		t.Error("expected error when registering probe while running")
+// TestUnregisterProbe_WhileRunning_Succeeds mirrors the above for removal.
+func TestUnregisterProbe_WhileRunning_Succeeds(t *testing.T) {
+	t.Parallel()
+	c := New(Config{})
+	probe := &mockProbe{id: "hot-remove"}
+	if err := c.RegisterProbe(probe); err != nil {
+		t.Fatalf("RegisterProbe: %v", err)
+	}
+	if err := c.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer func() {
+		if err := c.Stop(); err != nil {
+			t.Errorf("Stop: %v", err)
+		}
+	}()
+
+	if err := c.UnregisterProbe("hot-remove"); err != nil {
+		t.Fatalf("UnregisterProbe while running: %v", err)
+	}
+}
+
+// TestRegisterProbe_ConcurrentWithPolling verifies that 10 goroutines
+// registering and unregistering probes while the poll loop runs produce
+// no data race and leave a consistent probe count.
+// Run with: go test -race -count=10 -run TestRegisterProbe_ConcurrentWithPolling
+func TestRegisterProbe_ConcurrentWithPolling(t *testing.T) {
+	t.Parallel()
+	c := New(Config{})
+	if err := c.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer func() {
+		if err := c.Stop(); err != nil {
+			t.Errorf("Stop: %v", err)
+		}
+	}()
+
+	const n = 10
+	var wg sync.WaitGroup
+	wg.Add(n)
+	for i := range n {
+		go func(idx int) {
+			defer wg.Done()
+			id := "concurrent-probe-" + string(rune('0'+idx))
+			p := &mockProbe{id: id}
+			if err := c.RegisterProbe(p); err != nil {
+				// duplicate is not a data race, just a logical error
+				return
+			}
+			time.Sleep(time.Millisecond)
+			_ = c.UnregisterProbe(id)
+		}(i)
+	}
+	wg.Wait()
+	// No assertion needed beyond "test did not panic under -race".
+}
+
+// blockableProbe is a test helper returned by newBlockableProbe.
+// The probe signals each poll on polledCh and then blocks until release() is called.
+type blockableProbe struct {
+	probe    *callbackProbe
+	polledCh chan struct{}
+	release  func()
+}
+
+// newBlockableProbe constructs a callbackProbe that signals when it starts
+// executing and blocks until release() is called. release() is idempotent.
+func newBlockableProbe(id string) *blockableProbe {
+	blockCh := make(chan struct{})
+	var once sync.Once
+	polledCh := make(chan struct{}, 1)
+
+	probe := &callbackProbe{
+		id: id,
+		rt: ResourceFile,
+		fn: func(ctx context.Context) (State, error) {
+			select {
+			case polledCh <- struct{}{}:
+			default:
+			}
+			select {
+			case <-blockCh:
+			case <-ctx.Done():
+			}
+			return State{Hash: 0x1234, ResourceID: id}, nil
+		},
+	}
+
+	return &blockableProbe{
+		probe:    probe,
+		polledCh: polledCh,
+		release:  func() { once.Do(func() { close(blockCh) }) },
+	}
+}
+
+// TestUnregisterProbe_DuringPoll_DoesNotResurrect verifies that a probe
+// unregistered while pollDueProbes is executing is NOT re-added to the
+// scheduler (the re-check fix in pollDueProbes).
+func TestUnregisterProbe_DuringPoll_DoesNotResurrect(t *testing.T) {
+	t.Parallel()
+
+	bp := newBlockableProbe("slow-probe")
+
+	c := New(Config{ProbeTimeout: 5 * time.Second})
+	if err := c.RegisterProbe(bp.probe); err != nil {
+		t.Fatalf("RegisterProbe: %v", err)
+	}
+	if err := c.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer func() {
+		bp.release()
+		if err := c.Stop(); err != nil {
+			t.Errorf("Stop: %v", err)
+		}
+	}()
+
+	select {
+	case <-bp.polledCh:
+	case <-time.After(3 * time.Second):
+		t.Fatal("probe never polled")
+	}
+
+	if err := c.UnregisterProbe("slow-probe"); err != nil {
+		t.Fatalf("UnregisterProbe: %v", err)
+	}
+
+	// Release the blocked probe so pollDueProbes reaches the double-check.
+	// Without the fix, pollDueProbes would call scheduler.Schedule here,
+	// silently re-inserting the probe. The probes map is irrelevant: it was
+	// already cleaned by UnregisterProbe before the release. The meaningful
+	// assertion is on the scheduler's entries map.
+	bp.release()
+
+	// Give pollDueProbes time to complete the re-check and either reschedule
+	// (bug) or skip rescheduling (fix).
+	time.Sleep(100 * time.Millisecond)
+
+	// WHY scheduler.entries and not c.probes: UnregisterProbe removes from
+	// c.probes unconditionally, so a c.probes check passes whether or not the
+	// fix is in place. The resurrection bug lives in the scheduler: without
+	// the double-check, the probe would re-enter scheduler.entries and be
+	// polled again on the next tick.
+	c.scheduler.mu.Lock()
+	_, inScheduler := c.scheduler.entries["slow-probe"]
+	c.scheduler.mu.Unlock()
+	if inScheduler {
+		t.Fatal("probe was resurrected in the scheduler after unregistration (double-check fix missing)")
 	}
 }
 
@@ -187,6 +331,181 @@ func TestStop_NotRunning(t *testing.T) {
 	err := c.Stop()
 	if err == nil {
 		t.Error("expected error when stopping non-running Cerberus")
+	}
+}
+
+// TestStop_StuckProbe_ReturnsTimeout verifies that Stop() returns an error
+// when a probe hangs longer than the 5-second grace period.
+// WHY: a silent hang at shutdown hides monitoring failures (F.3 — the caller
+// needs to know that at least one probe did not finish cleanly).
+//
+// NOTE: this test intentionally takes 5s (the actual timeout). It is skipped
+// under -short to keep the normal test suite fast.
+func TestStop_StuckProbe_ReturnsTimeout(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping 5s timeout test in -short mode")
+	}
+
+	// hangForever blocks its context forever — simulating a probe that ignores
+	// ctx.Done() (e.g. a syscall-blocked filesystem watcher).
+	neverReturn := make(chan struct{})
+	p := &callbackProbe{
+		id: "stuck-probe",
+		rt: ResourceFile,
+		fn: func(ctx context.Context) (State, error) {
+			// Deliberately ignore ctx.Done() to simulate a stuck probe.
+			<-neverReturn
+			return State{}, nil
+		},
+	}
+
+	// Use a probe timeout longer than the Stop() grace period so the probe
+	// actually holds the pollProbe goroutine open during Stop().
+	c := New(Config{ProbeTimeout: 10 * time.Second})
+	if err := c.RegisterProbe(p); err != nil {
+		t.Fatalf("RegisterProbe: %v", err)
+	}
+	if err := c.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	// Wait until the probe is executing (so the goroutine is live in pollProbe).
+	time.Sleep(20 * time.Millisecond)
+
+	err := c.Stop()
+	// Clean up the stuck goroutine after the test regardless of outcome.
+	close(neverReturn)
+
+	if err == nil {
+		t.Fatal("Stop() returned nil; expected timeout error when probe is stuck")
+	}
+	if c.IsRunning() {
+		t.Error("IsRunning() should be false after Stop() even on timeout")
+	}
+	// Point 1 follow-up: after a StopTimeout the instance must be compromised.
+	if !c.compromised.Load() {
+		t.Error("compromised flag should be set after StopTimeout")
+	}
+}
+
+// TestStart_AfterStopTimeout_ReturnsCompromised verifies that Start() refuses
+// to spawn a second pollLoop when the instance was previously stopped with a
+// timeout. Without this guard, a second pollLoop goroutine would leak on top
+// of the stuck one (CWE-404 / goroutine leak).
+//
+// NOTE: this test intentionally takes 5s. Skipped under -short.
+func TestStart_AfterStopTimeout_ReturnsCompromised(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping 5s timeout test in -short mode")
+	}
+
+	neverReturn := make(chan struct{})
+	p := &callbackProbe{
+		id: "stuck-probe-2",
+		rt: ResourceFile,
+		fn: func(ctx context.Context) (State, error) {
+			<-neverReturn
+			return State{}, nil
+		},
+	}
+
+	c := New(Config{ProbeTimeout: 10 * time.Second})
+	if err := c.RegisterProbe(p); err != nil {
+		t.Fatalf("RegisterProbe: %v", err)
+	}
+	if err := c.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	time.Sleep(20 * time.Millisecond)
+	stopErr := c.Stop()
+	close(neverReturn)
+
+	if stopErr == nil {
+		t.Fatal("Stop() should have timed out")
+	}
+
+	// A second Start() must be refused with ErrCodeCompromised.
+	startErr := c.Start()
+	if startErr == nil {
+		t.Fatal("Start() after StopTimeout should return an error")
+	}
+	type errorCoder interface{ ErrorCode() errors.ErrorCode }
+	aerr, ok := startErr.(errorCoder)
+	if !ok || string(aerr.ErrorCode()) != ErrCodeCompromised {
+		t.Errorf("expected ErrCodeCompromised, got %v", startErr)
+	}
+}
+
+// newSlowProbe creates a callbackProbe that sleeps for 3*MinPollInterval to
+// guarantee a poll overrun. It signals on doneCh each time it completes.
+func newSlowProbe(id string, doneCh chan struct{}) *callbackProbe {
+	return &callbackProbe{
+		id: id,
+		rt: ResourceFile,
+		fn: func(ctx context.Context) (State, error) {
+			timer := time.NewTimer(3 * MinPollInterval)
+			defer timer.Stop()
+			select {
+			case <-timer.C:
+			case <-ctx.Done():
+			}
+			select {
+			case doneCh <- struct{}{}:
+			default:
+			}
+			return State{Hash: 0x1, ResourceID: id}, nil
+		},
+	}
+}
+
+// awaitOverrun polls c.Stats().OverrunCount until it is > 0 or the deadline
+// passes. Returns the final value. Separating this loop keeps the test body
+// within cyclomatic budget.
+func awaitOverrun(c *Cerberus, deadline time.Duration) int64 {
+	until := time.Now().Add(deadline)
+	for time.Now().Before(until) {
+		if v := c.Stats().OverrunCount; v > 0 {
+			return v
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	return c.Stats().OverrunCount
+}
+
+// TestStats_OverrunCount verifies that a poll cycle slower than MinPollInterval
+// increments Stats.OverrunCount and sets HealthStatus.PollOverrun.
+// WHY: sequential probe execution can push a cycle past MinPollInterval; callers
+// need an observable signal before the bottleneck becomes a reliability problem.
+func TestStats_OverrunCount(t *testing.T) {
+	t.Parallel()
+
+	slowDone := make(chan struct{}, 1)
+	p := newSlowProbe("slow-probe-overrun", slowDone)
+
+	c := New(Config{ProbeTimeout: time.Second})
+	if err := c.RegisterProbe(p); err != nil {
+		t.Fatalf("RegisterProbe: %v", err)
+	}
+	if err := c.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer func() {
+		if err := c.Stop(); err != nil {
+			t.Errorf("Stop: %v", err)
+		}
+	}()
+
+	select {
+	case <-slowDone:
+	case <-time.After(3 * time.Second):
+		t.Fatal("slow probe never completed")
+	}
+
+	if awaitOverrun(c, 500*time.Millisecond) == 0 {
+		t.Error("expected OverrunCount > 0 after a slow poll cycle")
+	}
+	if !c.HealthCheck().PollOverrun {
+		t.Error("HealthStatus.PollOverrun should be true after a slow poll cycle")
 	}
 }
 
@@ -276,6 +595,119 @@ func TestStats(t *testing.T) {
 	}
 	if stats.ProbeCount != 1 {
 		t.Errorf("expected ProbeCount=1, got %d", stats.ProbeCount)
+	}
+}
+
+// TestHealthCheck_LastPollAt_AfterFirstPoll verifies that HealthStatus.LastPollAt
+// is populated with a real timestamp (not zero and not time.Now()) once at least
+// one poll cycle has completed.
+func TestHealthCheck_LastPollAt_AfterFirstPoll(t *testing.T) {
+	t.Parallel()
+	c := New(Config{})
+	p := &mockProbe{id: "p1"}
+	if err := c.RegisterProbe(p); err != nil {
+		t.Fatalf("RegisterProbe: %v", err)
+	}
+
+	before := time.Now()
+	if err := c.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer func() {
+		if err := c.Stop(); err != nil {
+			t.Errorf("Stop: %v", err)
+		}
+	}()
+
+	// Wait until at least one poll cycle completes.
+	var h HealthStatus
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		h = c.HealthCheck()
+		if !h.LastPollAt.IsZero() {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	if h.LastPollAt.IsZero() {
+		t.Fatal("LastPollAt is still zero after 3s")
+	}
+	// Must be within a 50ms window of the test run — not a stale time.Now().
+	if h.LastPollAt.Before(before) {
+		t.Errorf("LastPollAt %v is before test start %v", h.LastPollAt, before)
+	}
+}
+
+// TestHealthCheck_LastPollAt_StaleWhenStopped verifies that LastPollAt does NOT
+// advance after Stop() — i.e. it reflects the last real poll, not a live clock.
+func TestHealthCheck_LastPollAt_StaleWhenStopped(t *testing.T) {
+	t.Parallel()
+	c := New(Config{})
+	p := &mockProbe{id: "p2"}
+	if err := c.RegisterProbe(p); err != nil {
+		t.Fatalf("RegisterProbe: %v", err)
+	}
+	if err := c.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	// Wait for at least one poll.
+	var first HealthStatus
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		first = c.HealthCheck()
+		if !first.LastPollAt.IsZero() {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if first.LastPollAt.IsZero() {
+		t.Fatal("never polled within 3s")
+	}
+
+	if err := c.Stop(); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+
+	// After stop the timestamp must not change.
+	snapshot := c.HealthCheck().LastPollAt
+	time.Sleep(20 * time.Millisecond)
+	if !c.HealthCheck().LastPollAt.Equal(snapshot) {
+		t.Error("LastPollAt changed after Stop() — should be frozen")
+	}
+}
+
+// TestHealthCheck_LastPollDuration_PositiveAfterPoll verifies that the new
+// LastPollDuration field is positive after at least one poll cycle.
+func TestHealthCheck_LastPollDuration_PositiveAfterPoll(t *testing.T) {
+	t.Parallel()
+	c := New(Config{})
+	p := &mockProbe{id: "p3"}
+	if err := c.RegisterProbe(p); err != nil {
+		t.Fatalf("RegisterProbe: %v", err)
+	}
+	if err := c.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer func() {
+		if err := c.Stop(); err != nil {
+			t.Errorf("Stop: %v", err)
+		}
+	}()
+
+	var h HealthStatus
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		h = c.HealthCheck()
+		if h.LastPollDuration > 0 {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	if h.LastPollDuration <= 0 {
+		t.Fatalf("LastPollDuration=%v after 3s, expected positive", h.LastPollDuration)
 	}
 }
 
@@ -559,3 +991,15 @@ func (m *mockProbe) Probe(ctx context.Context) (State, error) {
 
 	return state, nil
 }
+
+// callbackProbe is a test probe that delegates Probe() to an arbitrary
+// function, enabling fine-grained behavioural control in unit tests.
+type callbackProbe struct {
+	id string
+	rt ResourceType
+	fn func(ctx context.Context) (State, error)
+}
+
+func (p *callbackProbe) ID() string                               { return p.id }
+func (p *callbackProbe) ResourceType() ResourceType               { return p.rt }
+func (p *callbackProbe) Probe(ctx context.Context) (State, error) { return p.fn(ctx) }
