@@ -680,10 +680,17 @@ func TestHealthCheck_LastPollAt_StaleWhenStopped(t *testing.T) {
 
 // TestHealthCheck_LastPollDuration_PositiveAfterPoll verifies that the new
 // LastPollDuration field is positive after at least one poll cycle.
+// WHY delay on the probe: on Windows, consecutive time.Now() calls inside a
+// single poll cycle can return the same value (coarse clock resolution), so a
+// zero-work probe produces elapsed==0 and the atomic stays 0. Adding a 1ms
+// delay guarantees elapsed >= 1ms on all platforms without changing production
+// code. We also use Stats().PollCount as the readiness gate instead of a
+// blind 3-second deadline, so the test is deterministic rather than racy.
 func TestHealthCheck_LastPollDuration_PositiveAfterPoll(t *testing.T) {
 	t.Parallel()
 	c := New(Config{})
-	p := &mockProbe{id: "p3"}
+	// delay: 1ms guarantees elapsed > 0 even on Windows with coarse clocks.
+	p := &mockProbe{id: "p3", delay: time.Millisecond}
 	if err := c.RegisterProbe(p); err != nil {
 		t.Fatalf("RegisterProbe: %v", err)
 	}
@@ -696,18 +703,22 @@ func TestHealthCheck_LastPollDuration_PositiveAfterPoll(t *testing.T) {
 		}
 	}()
 
-	var h HealthStatus
-	deadline := time.Now().Add(3 * time.Second)
+	// Wait until at least one full poll cycle has completed, then assert.
+	deadline := time.Now().Add(10 * time.Second)
 	for time.Now().Before(deadline) {
-		h = c.HealthCheck()
-		if h.LastPollDuration > 0 {
+		if c.Stats().PollCount >= 1 {
 			break
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
 
+	if c.Stats().PollCount == 0 {
+		t.Fatal("no poll cycle completed within 10s")
+	}
+
+	h := c.HealthCheck()
 	if h.LastPollDuration <= 0 {
-		t.Fatalf("LastPollDuration=%v after 3s, expected positive", h.LastPollDuration)
+		t.Fatalf("LastPollDuration=%v after poll cycle, expected positive", h.LastPollDuration)
 	}
 }
 
